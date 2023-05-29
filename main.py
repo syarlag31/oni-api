@@ -35,7 +35,7 @@ async def webhook(request: Request):
         response = lambda_client.invoke(
             FunctionName='testfunction',
             InvocationType='Event',  # Use 'Event' for asynchronous invocation
-            Payload=f'{encoded_data}'  # Optional payload data to pass to the Lambda function
+            Payload=encoded_data  # Optional payload data to pass to the Lambda function
         )
         
     except Exception as e:
