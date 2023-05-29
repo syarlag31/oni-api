@@ -12,6 +12,15 @@ def get_root():
 @app.post("/webhook")
 async def webhook(request: Request):
     try:
+        try:
+            data = await request.json()
+        except json.JSONDecodeError:
+            try:
+                # Attempt to convert the string into JSON
+                data = json.loads(await request.body())
+            except json.JSONDecodeError:
+                raise HTTPException(status_code=400, detail="Invalid JSON data")
+
         data = await request.json()
         encoded_data = json.dumps(data)
     
