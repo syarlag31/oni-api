@@ -42,38 +42,64 @@ async def webhook(request: Request):
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/alert")
-async def format_and_post(json_data: dict):
-    # Extract data from the input JSON
-    ticker = json_data.get("ticker")
-    color = json_data.get("color")
-    tp = json_data.get("TP")
-    stop_loss = json_data.get("stopLoss")
-    timestamp = json_data.get("timestamp")
-    
-    # Format the data into the desired JSON structure
+async def format_and_post_to_discord(data: dict):
+    try:
+        ticker = data["ticker"]
+        color = data["color"]
+        TP = data["TP"]
+        stopLoss = data["stopLoss"]
+        timestamp = data["timestamp"]
+    except KeyError as e:
+        raise HTTPException(status_code=400, detail=f"Missing required field: {str(e)}")
+
     formatted_json = {
         "content": None,
         "embeds": [
             {
-                "title": f"Sell Alert {ticker}",
+                "title": f"Entry Alert {ticker}",
                 "url": f"https://www.tradingview.com/symbols/{ticker}/",
-                "color": color,
+                "color": int(color),
                 "fields": [
                     {
-                        "name": "Sell",
-                        "value": str(stop_loss)
+                        "name": "Entry Buy",
+                        "value": str(stopLoss)
+                    },
+                    {
+                        "name": "TP 1",
+                        "value": str(TP[0]),
+                        "inline": True
+                    },
+                    {
+                        "name": "TP 2",
+                        "value": str(TP[1]),
+                        "inline": True
+                    },
+                    {
+                        "name": "TP 3",
+                        "value": str(TP[2]),
+                        "inline": True
+                    },
+                    {
+                        "name": "Stop Loss",
+                        "value": str(stopLoss - TP[0]),
+                        "inline": True
                     }
                 ],
                 "footer": {
-                    "text": "Free Beta Algo v1.0.0"
+                    "text": "Oni Algo v1.0.0"
                 },
                 "timestamp": timestamp
             }
         ]
     }
-    
-    # Post the formatted JSON to the Discord webhook URL
-    webhook_url = "https://discord.com/api/webhooks/1112897541919490190/8QpJ9Qxaw4eZR2BcU-hx4gtcFs-yUPZaBoHRT3Zjm21bvoAg3jsBSb3oea_ZmyfWb4gX"
-    response = requests.post(webhook_url, json=formatted_json)
-    
-    return {"status": response.status_code}
+
+    try:
+        response = requests.post(
+            "https://discord.com/api/webhooks/1112897541919490190/8QpJ9Qxaw4eZR2BcU-hx4gtcFs-yUPZaBoHRT3Zjm21bvoAg3jsBSb3oea_ZmyfWb4gX",
+            json=formatted_json
+        )
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=500, detail=f"Failed to post to Discord: {str(e)}")
+
+    return {"message": "Formatted JSON posted to Discord successfully"}
