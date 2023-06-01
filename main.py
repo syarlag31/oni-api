@@ -45,6 +45,7 @@ async def format_and_post_to_discord(data: dict):
     try:
         ticker = data["ticker"]
         color = data["color"]
+        entry = data["entry"]
         TP = data["TP"]
         stopLoss = data["stopLoss"]
         timestamp = data["timestamp"]
@@ -61,7 +62,7 @@ async def format_and_post_to_discord(data: dict):
                 "fields": [
                     {
                         "name": "Entry Buy",
-                        "value": str(stopLoss)
+                        "value": str(entry)
                     },
                     {
                         "name": "TP 1",
@@ -80,7 +81,7 @@ async def format_and_post_to_discord(data: dict):
                     },
                     {
                         "name": "Stop Loss",
-                        "value": str(stopLoss - TP[0]),
+                        "value": str(stopLoss),
                         "inline": True
                     }
                 ],
