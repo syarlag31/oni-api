@@ -1,106 +1,99 @@
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect
+from fastapi.security import APIKeyHeader
+import psycopg2
 from dotenv import load_dotenv
-import boto3, os, json, requests
+import os, secrets
+from typing import List, Dict
+from pydantic import BaseModel
 
 load_dotenv()
-app = FastAPI(
-    #docs_url=None, # Disable docs (Swagger UI) for PROD
-    #redoc_url=None, # Disable redoc for PROD
+app = FastAPI()
+
+# Database Connection
+connection = psycopg2.connect(
+    host=os.getenv("DB_HOST"),
+    port=os.getenv("DB_PORT"),
+    dbname=os.getenv("DB_NAME"),
+    user=os.getenv("DB_USER"),
+    password=os.getenv("DB_PASSWORD")
 )
 
-# @app.post("/webhook")
-# async def webhook(request: Request):
-#     try:
-#         try:
-#             data = await request.json()
-#         except json.JSONDecodeError:
-#             try:
-#                 # Attempt to convert the string into JSON
-#                 data = json.loads(await request.body())
-#             except json.JSONDecodeError:
-#                 raise HTTPException(status_code=400, detail="Invalid JSON data")
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
-#         data = await request.json()
-#         encoded_data = json.dumps(data)
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Dict[str, WebSocket] = {}
+
+    async def connect(self, websocket: WebSocket, session_token: str):
+        await websocket.accept()
+        self.active_connections[session_token] = websocket
+        print(self.active_connections)
+
+    async def disconnect(self, session_token: str):
+        websocket = self.active_connections.get(session_token)
+        if websocket:
+            await websocket.close()
+            del self.active_connections[session_token]
+
+    async def send_json(self, data: str):
+        for websocket in self.active_connections.values():
+            await websocket.send_json(data)
+
+manager = ConnectionManager()
+
+async def authenticate_user(api_key: str = Depends(api_key_header)):
+    cursor = connection.cursor()
+    query = "SELECT * FROM users WHERE id = %s"
+    cursor.execute(query, (api_key,))
+    user = cursor.fetchone()
+    cursor.close()
+
+    if user is None:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    return user
+
+def generate_session_token():
+    return secrets.token_hex(16)
+
+@app.post("/session-token")
+async def get_session_token(user=Depends(authenticate_user)):
+    session_token = generate_session_token()
+
+    try:
+        cursor = connection.cursor()
+        query = "UPDATE users SET session_token = %s WHERE id = %s"
+        cursor.execute(query, (session_token, str(user[0])))  # Convert UUID to string
+        connection.commit()
+        cursor.close()
+
+        return {"session_token": session_token}
+    except Exception as e:
+        connection.rollback()  # Rollback the transaction in case of an error
+        raise e
+
+@app.websocket("/ws/{session_token}")
+async def websocket_endpoint(websocket: WebSocket, session_token: str):
+    cursor = connection.cursor()
+    query = "SELECT session_token FROM users WHERE session_token = %s"
+    cursor.execute(query, (session_token,))
+    session = cursor.fetchone()
+    cursor.close()
+
+    if session is None:
+        await websocket.close(code=1008)
+        return
     
-#         ACCESS_KEY = os.getenv('ACCESS_KEY')
-#         SECRET_KEY = os.getenv('SECRET_KEY')
-#         region = 'us-east-2'
-
-#         lambda_client = boto3.client('lambda', aws_access_key_id=ACCESS_KEY,
-#                                     aws_secret_access_key=SECRET_KEY,
-#                                     region_name=region)
-        
-#         response = lambda_client.invoke(
-#             FunctionName='testfunction',
-#             InvocationType='Event',  # Use 'Event' for asynchronous invocation
-#             Payload=encoded_data  # Optional payload data to pass to the Lambda function
-#         )
-        
-#     except Exception as e:
-#         raise HTTPException(status_code=400, detail=str(e))
-
-@app.post("/alert")
-async def format_and_post_to_discord(data: dict):
+    await manager.connect(websocket, session_token)
     try:
-        ticker = data["ticker"]
-        color = data["color"]
-        entry = data["entry"]
-        TP = data["TP"]
-        stopLoss = data["stopLoss"]
-        timestamp = data["timestamp"]
-    except KeyError as e:
-        raise HTTPException(status_code=400, detail=f"Missing required field: {str(e)}")
+        while True:
+            data = await websocket.receive_text()
+    except WebSocketDisconnect:
+        await manager.disconnect(session_token)
 
-    formatted_json = {
-        "content": None,
-        "embeds": [
-            {
-                "title": f"Entry Alert {ticker}",
-                "url": f"https://www.tradingview.com/symbols/{ticker}/",
-                "color": int(color),
-                "fields": [
-                    {
-                        "name": "Entry Buy",
-                        "value": str(entry)
-                    },
-                    {
-                        "name": "TP 1",
-                        "value": str(TP[0]),
-                        "inline": True
-                    },
-                    {
-                        "name": "TP 2",
-                        "value": str(TP[1]),
-                        "inline": True
-                    },
-                    {
-                        "name": "TP 3",
-                        "value": str(TP[2]),
-                        "inline": True
-                    },
-                    {
-                        "name": "Stop Loss",
-                        "value": str(stopLoss),
-                        "inline": True
-                    }
-                ],
-                "footer": {
-                    "text": "Oni Algo v1.0.0"
-                },
-                "timestamp": timestamp
-            }
-        ]
-    }
+class Message(BaseModel):
+    data: Dict
 
-    try:
-        # Sends request to the URL below. Currently static and works for only one URL that can be replaced below
-        response = requests.post(
-            "https://discord.com/api/webhooks/1112897541919490190/8QpJ9Qxaw4eZR2BcU-hx4gtcFs-yUPZaBoHRT3Zjm21bvoAg3jsBSb3oea_ZmyfWb4gX",
-            json=formatted_json
-        )
-        response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=500, detail=f"Failed to post to Discord: {str(e)}")
-
-    return {"message": "Formatted JSON posted to Discord successfully"}
+@app.post("/send-message")
+async def send_message(message: Message):
+    await manager.send_json(message.data)
