@@ -2,8 +2,8 @@ from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconn
 from fastapi.security import APIKeyHeader
 import psycopg2
 from dotenv import load_dotenv
-import os, secrets
-from typing import List, Dict
+import os, secrets, time, requests
+from typing import Dict
 from pydantic import BaseModel
 
 load_dotenv()
@@ -18,7 +18,7 @@ connection = psycopg2.connect(
     password=os.getenv("DB_PASSWORD")
 )
 
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+api_key_header = APIKeyHeader(name="Oni-API-Key", auto_error=False)
 
 class ConnectionManager:
     def __init__(self):
@@ -60,36 +60,82 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 async def authenticate_user(api_key: str = Depends(api_key_header)):
-    cursor = connection.cursor()
-    query = "SELECT * FROM users WHERE id = %s"
-    cursor.execute(query, (api_key,))
-    user = cursor.fetchone()
-    cursor.close()
+    try:
+        cursor = connection.cursor()
+        query = "SELECT * FROM users WHERE id = %s"
+        cursor.execute(query, (api_key,))
+        user = cursor.fetchone()
+        cursor.close()
+    except Exception:
+        return
 
     if user is None:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
-    return user
+    user_model = User(id=str(user[0]), session_token=str(user[1]))  # Create a User instance
+    return user_model
 
 def generate_session_token():
     return secrets.token_hex(16)
 
-@app.post("/session-token")
+class User(BaseModel):
+    id: str
+    session_token: str
+
+@app.post("/login")
 async def get_session_token(user=Depends(authenticate_user)):
     session_token = generate_session_token()
-    user_id = str(user[0]) # Convert UUID to string
 
     try:
         cursor = connection.cursor()
         query = "UPDATE users SET session_token = %s WHERE id = %s"
-        cursor.execute(query, (session_token, user_id))
+        cursor.execute(query, (session_token, user.id))
         connection.commit()
         cursor.close()
 
-        return {"session_token": session_token}
+        return {"session token": session_token}
     except Exception as e:
         connection.rollback()  # Rollback the transaction in case of an error
-        raise e
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+app.post("/validate-session")
+async def validate_user_session(api_key: str, session_token: str, user=Depends(authenticate_user)):
+    if api_key == user.id and session_token == user.session_token:
+        return "Success", 200
+    else:
+        return HTTPException(status_code=498, detail="Improper Session")
+
+class TokenBucket:
+    def __init__(self, tokens, fill_rate):
+        """
+        tokens is the total tokens in the bucket. fill_rate is the
+        rate in tokens/second that the bucket will be refilled.
+        """
+        self.capacity = float(tokens)
+        self._tokens = float(tokens)
+        self.fill_rate = float(fill_rate)
+        self.timestamp = time.monotonic()
+
+    def consume(self, tokens):
+        """
+        Consume tokens from the bucket. Returns 0 if there were
+        sufficient tokens, otherwise the expected time to wait
+        until enough tokens become available.
+        """
+        if tokens <= self._tokens:
+            self._tokens -= tokens
+            return 0
+        else:
+            delta = time.monotonic() - self.timestamp
+            self._tokens += delta * self.fill_rate
+            self.timestamp = time.monotonic()
+            if tokens <= self._tokens:
+                self._tokens -= tokens
+                return 0
+            else:
+                return (tokens - self._tokens) / self.fill_rate
+
+rate_limits = {}  # Create a global dictionary to manage the rate limits
 
 @app.websocket("/ws/{session_token}")
 async def websocket_endpoint(websocket: WebSocket, session_token: str):
@@ -105,16 +151,99 @@ async def websocket_endpoint(websocket: WebSocket, session_token: str):
 
     user_id, session_token = str(session[0]), session[1]  # Convert UUID to string
     await manager.connect(websocket, session_token, user_id)
+
+    # Set up rate limit for this user
+    rate_limit = rate_limits.get(user_id, TokenBucket(5, 1))  # Allow 5 messages per second
+
     try:
         while True:
-            data = await websocket.receive_text()
-            # Add message verification
+            wait_time = rate_limit.consume(1)  # Each message consumes one token
+            if wait_time == 0:
+                data = await websocket.receive_text()
+                print(data)
+                # Add message verification
+            else:
+                # If rate limit is exceeded, close the connection
+                await manager.disconnect(session_token)
+                return
     except WebSocketDisconnect:
         await manager.disconnect(session_token)
 
 class Message(BaseModel):
     data: Dict
 
+
 @app.post("/send-message")
 async def send_message(message: Message):
+    if message["oni auth key"] == os.getenv("ONI_AUTH_KEY"):
+            raise HTTPException(status_code=401, detail="Improper Authorization Key")
     await manager.send_json(message.data)
+
+@app.post("/alert")
+async def format_and_post_to_discord(data: dict):
+    try:
+        auth_key = data["oni auth key"]
+        ticker = data["ticker"]
+        color = data["color"]
+        entry = data["entry"]
+        TP = data["TP"]
+        stopLoss = data["stopLoss"]
+        timestamp = data["timestamp"]
+
+        if auth_key != os.getenv("ONI_AUTH_KEY"):
+            raise HTTPException(status_code=401, detail="Improper Authorization Key")
+    except KeyError as e:
+        raise HTTPException(status_code=400, detail=f"Missing required field")
+
+    formatted_json = {
+        "content": None,
+        "embeds": [
+            {
+                "title": f"Entry Alert {ticker}",
+                "url": f"https://www.tradingview.com/symbols/{ticker}/",
+                "color": int(color),
+                "fields": [
+                    {
+                        "name": "Entry Buy",
+                        "value": str(entry)
+                    },
+                    {
+                        "name": "TP 1",
+                        "value": str(TP[0]),
+                        "inline": True
+                    },
+                    {
+                        "name": "TP 2",
+                        "value": str(TP[1]),
+                        "inline": True
+                    },
+                    {
+                        "name": "TP 3",
+                        "value": str(TP[2]),
+                        "inline": True
+                    },
+                    {
+                        "name": "Stop Loss",
+                        "value": str(stopLoss),
+                        "inline": True
+                    }
+                ],
+                "footer": {
+                    "text": "Oni Algo v1.0.0"
+                },
+                "timestamp": timestamp
+            }
+        ]
+    }
+
+    try:
+        # Sends request to the URL below. Currently static and works for only one URL that can be replaced below
+        response = requests.post(
+            "https://discord.com/api/webhooks/1112897541919490190/8QpJ9Qxaw4eZR2BcU-hx4gtcFs-yUPZaBoHRT3Zjm21bvoAg3jsBSb3oea_ZmyfWb4gX",
+            json=formatted_json
+        )
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=500, detail=f"Failed to post to Discord")
+
+    return {"message": "Formatted JSON posted to Discord successfully"}
