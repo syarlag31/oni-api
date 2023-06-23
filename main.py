@@ -1,22 +1,33 @@
+import json
 from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect
 from fastapi.security import APIKeyHeader
-import psycopg2
 from dotenv import load_dotenv
-import os, secrets, time, requests
 from typing import Dict
 from pydantic import BaseModel
+import os
+import secrets
+import time
+import requests
+import asyncpg
 
 load_dotenv()
 app = FastAPI()
 
-# Database Connection
-connection = psycopg2.connect(
-    host=os.getenv("DB_HOST"),
-    port=os.getenv("DB_PORT"),
-    dbname=os.getenv("DB_NAME"),
-    user=os.getenv("DB_USER"),
-    password=os.getenv("DB_PASSWORD")
-)
+api_key_header = APIKeyHeader(name="Oni-API-Key", auto_error=False)
+
+@app.on_event("startup")
+async def startup_event():
+    app.state.conn = await asyncpg.connect(
+        host=os.getenv("DB_HOST"),
+        port=os.getenv("DB_PORT"),
+        database=os.getenv("DB_NAME"),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD"),
+    )
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await app.state.conn.close()
 
 api_key_header = APIKeyHeader(name="Oni-API-Key", auto_error=False)
 
@@ -43,10 +54,15 @@ class ConnectionManager:
                 pass  # The socket was already closed
             del self.active_connections[session_token]
 
-    async def send_json(self, data: str):
+    async def send_json_to_all(self, data: str):
         for websocket in self.active_connections.values():
             await websocket.send_json(data)
-
+            
+    async def send_json_to_user(self, user_id: str, data: str):
+        websocket = self.active_connections.get(user_id)
+        if websocket:
+            await websocket.send_json(data)
+            
     async def check_and_close(self, old_token: str):
         if old_token in self.active_connections:
             websocket = self.active_connections[old_token]
@@ -61,11 +77,9 @@ manager = ConnectionManager()
 
 async def authenticate_user(api_key: str = Depends(api_key_header)):
     try:
-        cursor = connection.cursor()
-        query = "SELECT * FROM users WHERE id = %s"
-        cursor.execute(query, (api_key,))
-        user = cursor.fetchone()
-        cursor.close()
+        conn = app.state.conn
+        query = "SELECT * FROM users WHERE api_key = $1"
+        user = await conn.fetchrow(query, api_key)
     except Exception:
         return
 
@@ -85,25 +99,26 @@ class User(BaseModel):
 @app.post("/login")
 async def get_session_token(user=Depends(authenticate_user)):
     session_token = generate_session_token()
-
     try:
-        cursor = connection.cursor()
-        query = "UPDATE users SET session_token = %s WHERE id = %s"
-        cursor.execute(query, (session_token, user.id))
-        connection.commit()
-        cursor.close()
-
+        conn = app.state.conn
+        query = "UPDATE users SET session_token = $1 WHERE id = $2"
+        await conn.execute(query, session_token, user.id)
         return {"session token": session_token}
     except Exception as e:
-        connection.rollback()  # Rollback the transaction in case of an error
         raise HTTPException(status_code=401, detail="Invalid API key")
     
-app.post("/validate-session")
-async def validate_user_session(api_key: str, session_token: str, user=Depends(authenticate_user)):
-    if api_key == user.id and session_token == user.session_token:
-        return "Success", 200
-    else:
-        return HTTPException(status_code=498, detail="Improper Session")
+async def check_session_and_api_key(session_token: str, api_key: str) -> bool:
+    if session_token is None or api_key is None:
+        return False
+    
+    conn = app.state.conn
+    query = "SELECT * FROM users WHERE session_token = $1 AND api_key = $2"
+    user = await conn.fetchrow(query, session_token, api_key)
+    
+    if user is None:
+        return False
+    else: 
+        return True
 
 class TokenBucket:
     def __init__(self, tokens, fill_rate):
@@ -139,11 +154,9 @@ rate_limits = {}  # Create a global dictionary to manage the rate limits
 
 @app.websocket("/ws/{session_token}")
 async def websocket_endpoint(websocket: WebSocket, session_token: str):
-    cursor = connection.cursor()
-    query = "SELECT id, session_token FROM users WHERE session_token = %s"
-    cursor.execute(query, (session_token,))
-    session = cursor.fetchone()
-    cursor.close()
+    conn = app.state.conn
+    query = "SELECT id, session_token FROM users WHERE session_token = $1"
+    session = await conn.fetchrow(query, session_token)
 
     if session is None:
         await websocket.close(code=1008)
@@ -159,41 +172,155 @@ async def websocket_endpoint(websocket: WebSocket, session_token: str):
         while True:
             wait_time = rate_limit.consume(1)  # Each message consumes one token
             if wait_time == 0:
-                data = await websocket.receive_text()
-                print(data)
-                # Add message verification
+                try:
+                    message = await websocket.receive()
+                    try:
+                        data = json.loads(message)
+                        print(data)
+                        print(type(data))
+                    except json.JSONDecodeError:
+                        print("Received message is not in JSON format.")
+                except Exception as e:
+                    print("An error occurred while receiving the WebSocket message:", e)
+                
+                if await check_session_and_api_key(data.get('session_token'), data.get('api_key')):
+                    print("checking condition")
+                    # Buy Condition
+                    if data.get('condition') == 'buy':
+                        print("buy")
+                        query = """
+                        INSERT INTO user_trades (user_id, tv_buy_id, market_buy_id, take_profit_id, order_error)
+                        VALUES (
+                            (SELECT id FROM users WHERE session_token = $1),
+                            $2,
+                            $3,
+                            $4,
+                            false
+                        )
+                        """
+                        await conn.execute(query, session_token, data.get('tv_buy_id'), data.get('market_buy_id'), data.get('take_profit_id'))
+                    
+                    # Stop Condition    
+                    if data.get('condition') == 'stop':
+                        print("stop")
+                        query = """
+                        UPDATE user_trades
+                        SET stop_loss_id = $1, executed_flag = true, net_amount = $2
+                        WHERE user_id = (SELECT id FROM users WHERE session_token = $3)
+                        AND tv_buy_id = $4
+                        """
+                        await conn.execute(query, data.get('stop_loss_id'), data.get('net_amount'), session_token, data.get('tv_buy_id'))
+                    
+                    # TP Condition
+                    if data.get('condition') == 'tp':
+                        print("tp")
+                        query = """
+                        UPDATE user_trades
+                        SET stop_loss_id = $1, executed_flag = true, net_amount = $2
+                        WHERE user_id = (SELECT id FROM users WHERE session_token = $3)
+                        AND tv_buy_id = $4
+                        """
+                        await conn.execute(query, data.get('stop_loss_id'), data.get('net_amount'), session_token, data.get('tv_buy_id'))
+                else:
+                    # Invalid session based on old session token or api key
+                    print("how tf am i here")
+                    return                  
             else:
                 # If rate limit is exceeded, close the connection
+                print("no chance its rate limit")
                 await manager.disconnect(session_token)
                 return
-    except WebSocketDisconnect:
+    except WebSocketDisconnect as e:
+        print(e)
         await manager.disconnect(session_token)
 
 class Message(BaseModel):
     data: Dict
 
 
-@app.post("/send-message")
 async def send_message(message: Message):
-    if message["oni auth key"] == os.getenv("ONI_AUTH_KEY"):
-            raise HTTPException(status_code=401, detail="Improper Authorization Key")
-    await manager.send_json(message.data)
+    await manager.send_json_to_all(message)
 
 @app.post("/alert")
-async def format_and_post_to_discord(data: dict):
+async def handle_tradingview_alerts(data: str):
     try:
-        auth_key = data["oni auth key"]
-        ticker = data["ticker"]
-        color = data["color"]
-        entry = data["entry"]
-        TP = data["TP"]
-        stopLoss = data["stopLoss"]
-        timestamp = data["timestamp"]
-
+        conn = app.state.conn
+        data = json.loads(data)
+        auth_key = data["oni_auth_key"]
         if auth_key != os.getenv("ONI_AUTH_KEY"):
             raise HTTPException(status_code=401, detail="Improper Authorization Key")
+        client_json = {
+            "condition": data["condition"],
+            "ticker": data["ticker"],
+            "tv_buy_id": data["tv_buy_id"]
+        }
+
+        if data["condition"] == 'buy':
+            query = """
+                INSERT INTO buys (tv_buy_id, ticker, script_version)
+                VALUES ($1, $2, $3)
+                """
+            await conn.execute(query, data["tv_buy_id"], data["ticker"], data["script_version"])
+            
+            discord = {
+                "ticker": data["ticker"],
+                "color": data["color"],
+                "entry": data["entry"],
+                "tp": data["tp"],
+                "stop": data["stop"],
+                "timestamp": data["timestamp"],
+                "script_version": data["script_version"]
+            }
+            await format_and_post_to_discord(discord)
+            client_json["tp"] = data["tp"]
+        else:
+            raise HTTPException(status_code=400, detail=f"Incorrect condition")
+        await send_message(client_json)
     except KeyError as e:
         raise HTTPException(status_code=400, detail=f"Missing required field")
+    
+@app.post('/alert/tp')
+async def alert_take_profit(data: str):
+    conn = app.state.conn
+    data = json.loads(data)
+    auth_key = data["oni_auth_key"]
+    if auth_key != os.getenv("ONI_AUTH_KEY"):
+        raise HTTPException(status_code=401, detail="Improper Authorization Key")
+    condition = data["condition"]
+    ticker = data["ticker"]
+    tv_buy_id = data["tv_buy_id"]
+    query = """
+    SELECT user_id
+    FROM user_trades
+    WHERE tv_buy_id = $1
+    """
+    await conn.execute(query, tv_buy_id)
+    users = conn.fetchall()
+    if users:
+            for row in users:
+                # Get the buy and tp id's
+                market_buy_id = row['market_buy_id']
+                take_profit_id = row['take_profit_id']
+                # Format some json with fields
+                response = {
+                    "condition": condition,
+                    "ticker": ticker,
+                    "tv_buy_id": tv_buy_id,
+                    "market_buy_id": market_buy_id,
+                    "take_profit_id": take_profit_id
+                }
+                # Send json to the specific websocket with the corresponding market_buy_id
+                user_id = row['user_id']
+                await manager.send_json_to_user(user_id, response)
+    
+async def format_and_post_to_discord(data: dict):
+    ticker = data.get("ticker")
+    color = data.get("color")
+    entry = data.get("entry")
+    tp = data.get("tp")
+    stop = data.get("stop")
+    timestamp = data.get("timestamp")
+    script_version = data.get("script_version")
 
     formatted_json = {
         "content": None,
@@ -209,27 +336,27 @@ async def format_and_post_to_discord(data: dict):
                     },
                     {
                         "name": "TP 1",
-                        "value": str(TP[0]),
+                        "value": str(tp[0]),
                         "inline": True
                     },
                     {
                         "name": "TP 2",
-                        "value": str(TP[1]),
+                        "value": str(tp[1]),
                         "inline": True
                     },
                     {
                         "name": "TP 3",
-                        "value": str(TP[2]),
+                        "value": str(tp[2]),
                         "inline": True
                     },
                     {
                         "name": "Stop Loss",
-                        "value": str(stopLoss),
+                        "value": str(stop),
                         "inline": True
                     }
                 ],
                 "footer": {
-                    "text": "Oni Algo v1.0.0"
+                    "text": f"Oni Algo {script_version}"
                 },
                 "timestamp": timestamp
             }
