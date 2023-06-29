@@ -25,6 +25,8 @@ async def startup_event():
         user=os.getenv("DB_USER"),
         password=os.getenv("DB_PASSWORD"),
     )
+    
+    asyncio.create_task(send_json_message_periodically())
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -180,16 +182,17 @@ async def handle_client_condition(user_id, data):
     conn = app.state.conn
     if data.get('condition') == 'buy':
         query = """
-        INSERT INTO user_trades (user_id, tv_buy_id, market_buy_id, take_profit_id, order_error)
+        INSERT INTO user_trades (user_id, tv_buy_id, market_buy_id, take_profit_id, tp, order_error)
         VALUES (
             (SELECT id FROM users WHERE id = $1),
             $2,
             $3,
             $4,
+            $5,
             false
         )
         """
-        await conn.execute(query, user_id, data.get('tv_buy_id'), data.get('market_buy_id'), data.get('take_profit_id'))
+        await conn.execute(query, user_id, data.get('tv_buy_id'), data.get('market_buy_id'), data.get('take_profit_id'), data.get('tp'))
     
     # Stop Condition    
     if data.get('condition') == 'stop':
@@ -210,6 +213,7 @@ async def handle_client_condition(user_id, data):
         AND tv_buy_id = $4
         """
         await conn.execute(query, data.get('stop_loss_id'), data.get('net_amount'), user_id, data.get('tv_buy_id'))
+    
     
 
 @app.post("/alert")
@@ -244,44 +248,73 @@ async def handle_tradingview_alerts(data: str):
             }
             await format_and_post_to_discord(discord)
             client_json["tp"] = data["tp"]
+            await manager.broadcast(client_json)
+            
+        elif data["condition"] == 'stop':
+            condition = data["condition"]
+            ticker = data["ticker"]
+            tv_buy_id = data["tv_buy_id"]
+            query = """
+            SELECT user_id, market_buy_id, take_profit_id
+            FROM user_trades
+            WHERE tv_buy_id = $1
+            """
+            users = await conn.fetch(query, tv_buy_id)
+            
+        elif data["condition"] == "executed":
+            
+            
+            if users:
+                for row in users:
+                    # Get the buy and tp id's
+                    market_buy_id = row['market_buy_id']
+                    take_profit_id = row['take_profit_id']
+                    # Format some json with fields
+                    response = {
+                        "condition": condition,
+                        "ticker": ticker,
+                        "tv_buy_id": tv_buy_id,
+                        "market_buy_id": market_buy_id,
+                        "take_profit_id": take_profit_id
+                    }
+                    # Send json to the specific websocket with the corresponding market_buy_id
+                    user_id = str(row['user_id'])
+                    await manager.send_personal_message(user_id, response)
+        
+        # elif data["condition"] == 'tp':
+        #     condition = data["condition"]
+        #     ticker = data["ticker"]
+        #     tv_buy_id = data["tv_buy_id"]
+        #     tp = data["tp"]
+        #     query = """
+        #     SELECT user_id, market_buy_id, take_profit_id
+        #     FROM user_trades
+        #     WHERE tv_buy_id = $1 and tp = $2
+        #     """
+        #     users = await conn.fetch(query, tv_buy_id, tp)
+            
+        #     if users:
+        #         for row in users:
+        #             # Get the buy and tp id's
+        #             market_buy_id = row['market_buy_id']
+        #             take_profit_id = row['take_profit_id']
+        #             # Format some json with fields
+        #             response = {
+        #                 "condition": condition,
+        #                 "ticker": ticker,
+        #                 "tv_buy_id": tv_buy_id,
+        #                 "market_buy_id": market_buy_id,
+        #                 "take_profit_id": take_profit_id
+        #             }
+        #             # Send json to the specific websocket with the corresponding market_buy_id
+        #             user_id = str(row['user_id'])
+        #             await manager.send_personal_message(user_id, response)
+
         else:
             raise HTTPException(status_code=400, detail=f"Incorrect condition")
-        await manager.broadcast(client_json)
     except KeyError as e:
         raise HTTPException(status_code=400, detail=f"Missing required field")
     
-@app.post('/alert/tp')
-async def alert_take_profit(data: str):
-    conn = app.state.conn
-    data = json.loads(data)
-    auth_key = data["oni_auth_key"]
-    if auth_key != os.getenv("ONI_AUTH_KEY"):
-        raise HTTPException(status_code=401, detail="Improper Authorization Key")
-    condition = data["condition"]
-    ticker = data["ticker"]
-    tv_buy_id = data["tv_buy_id"]
-    query = """
-    SELECT user_id, market_buy_id, take_profit_id
-    FROM user_trades
-    WHERE tv_buy_id = $1
-    """
-    users = await conn.fetch(query, tv_buy_id)
-    if users:
-            for row in users:
-                # Get the buy and tp id's
-                market_buy_id = row['market_buy_id']
-                take_profit_id = row['take_profit_id']
-                # Format some json with fields
-                response = {
-                    "condition": condition,
-                    "ticker": ticker,
-                    "tv_buy_id": tv_buy_id,
-                    "market_buy_id": market_buy_id,
-                    "take_profit_id": take_profit_id
-                }
-                # Send json to the specific websocket with the corresponding market_buy_id
-                user_id = str(row['user_id'])
-                await manager.send_personal_message(user_id, response)
     
 async def format_and_post_to_discord(data: dict):
     ticker = data.get("ticker")
@@ -344,3 +377,36 @@ async def format_and_post_to_discord(data: dict):
         raise HTTPException(status_code=500, detail=f"Failed to post to Discord")
 
     return {"message": "Formatted JSON posted to Discord successfully"}
+
+async def send_json_message_periodically():
+    while True:
+        await asyncio.sleep(3 * 60 * 60)  # Wait for 3 hours
+        conn = app.state.conn
+        query = """
+        SELECT user_id, tv_buy_id, market_buy_id, take_profit_id
+        FROM user_trades
+        WHERE executed_flag = true
+        """
+        executed_trades = await conn.fetch(query)
+
+        if executed_trades:
+            user_orders = {}
+
+            for row in executed_trades:
+                user_id = str(row['user_id'])
+                order = {
+                    "tv_buy_id": row['tv_buy_id'],
+                    "market_buy_id": row['market_buy_id'],
+                    "take_profit_id": row['take_profit_id']
+                }
+                if user_id in user_orders:
+                    user_orders[user_id].append(order)
+                else:
+                    user_orders[user_id] = [order]
+
+            for user_id, orders in user_orders.items():
+                message = {
+                    "condition": "check",
+                    "orders": orders
+                }
+                await manager.send_personal_message(user_id, message)
