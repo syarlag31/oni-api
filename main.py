@@ -1,8 +1,9 @@
+import asyncio
 import json
 from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect
 from fastapi.security import APIKeyHeader
 from dotenv import load_dotenv
-from typing import Dict
+from typing import Any, Dict
 from pydantic import BaseModel
 import os
 import secrets
@@ -31,47 +32,68 @@ async def shutdown_event():
 
 api_key_header = APIKeyHeader(name="Oni-API-Key", auto_error=False)
 
+class Connection:
+    def __init__(self, websocket: WebSocket, session_token: str):
+        self.websocket = websocket
+        self.session_token = session_token
+
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: Dict[str, WebSocket] = {}
-        self.user_connections: Dict[str, str] = {}
+        self.active_connections: Dict[str, Connection] = {}  # user_id: Connection
 
-    async def connect(self, websocket: WebSocket, session_token: str, user_id: str):
-        await websocket.accept()
-        if user_id in self.user_connections:  # User has an existing session
-            old_token = self.user_connections[user_id]
-            await self.check_and_close(old_token)
-        self.active_connections[session_token] = websocket
-        self.user_connections[user_id] = session_token
-        print(self.active_connections)
-
-    async def disconnect(self, session_token: str):
-        websocket = self.active_connections.get(session_token)
-        if websocket:
-            try:
-                await websocket.close()
-            except RuntimeError:
-                pass  # The socket was already closed
-            del self.active_connections[session_token]
-
-    async def send_json_to_all(self, data: str):
-        for websocket in self.active_connections.values():
-            await websocket.send_json(data)
-            
-    async def send_json_to_user(self, user_id: str, data: str):
-        websocket = self.active_connections.get(user_id)
-        if websocket:
-            await websocket.send_json(data)
-            
-    async def check_and_close(self, old_token: str):
-        if old_token in self.active_connections:
-            websocket = self.active_connections[old_token]
-            if websocket:
+    async def connect(self, user_id: str, websocket: WebSocket, session_token: str):
+        if user_id in self.active_connections:
+            old_connection = self.active_connections[user_id]
+            if old_connection.session_token != session_token:
                 try:
-                    await websocket.close()
-                except RuntimeError:
-                    pass  # The socket was already closed
-                del self.active_connections[old_token]
+                    await old_connection.websocket.send_text("Another session was initiated, disconnecting.")
+                    await old_connection.websocket.close(code=1000)
+                except WebSocketDisconnect:
+                    pass  # If it is already disconnected, pass.
+                del self.active_connections[user_id]  # Remove old connection
+            else:
+                try:
+                    await old_connection.websocket.send_text("Duplicate session detected, disconnecting.")
+                    await old_connection.websocket.close(code=1000)
+                except WebSocketDisconnect:
+                    pass  # If it is already disconnected, pass.
+                del self.active_connections[user_id]  # Remove old connection
+            await asyncio.sleep(3)
+        self.active_connections[user_id] = Connection(websocket, session_token)
+        return self.active_connections[user_id]
+
+    async def disconnect(self, user_id: str):
+        if user_id in self.active_connections:
+            connection = self.active_connections[user_id]
+            if connection.websocket:
+                await connection.websocket.close(code=1001)
+            del self.active_connections[user_id]
+
+    async def send_personal_message(self, user_id: str, message: Dict[str, Any]):
+        if user_id not in self.active_connections:
+            return
+        connection = self.active_connections[user_id]
+        try:
+            await connection.websocket.send_json(message)
+        except WebSocketDisconnect:
+            print(f"Failed to send message to user {user_id}")
+            await self.handle_disconnect(user_id)
+
+    async def broadcast(self, message: Dict[str, Any]):
+        disconnected_users = []
+        for user_id, connection in self.active_connections.items():
+            try:
+                await connection.websocket.send_json(message)
+            except WebSocketDisconnect:
+                print(f"Failed to send message to user {user_id}")
+                disconnected_users.append(user_id)
+        for user_id in disconnected_users:
+            await self.handle_disconnect(user_id)
+
+    async def handle_disconnect(self, user_id: str):
+        print("disconnecting user due to message sent", user_id)
+        await self.disconnect(user_id)
+        # Reconnection logic can be added here if necessary
 
 manager = ConnectionManager()
 
@@ -112,45 +134,14 @@ async def check_session_and_api_key(session_token: str, api_key: str) -> bool:
         return False
     
     conn = app.state.conn
-    query = "SELECT * FROM users WHERE session_token = $1 AND api_key = $2"
-    user = await conn.fetchrow(query, session_token, api_key)
+    query = "SELECT id FROM users WHERE session_token = $1 AND api_key = $2"
+    user = await conn.fetch(query, session_token, api_key)
     
-    if user is None:
-        return False
-    else: 
+    if len(user) > 0:
         return True
+    else: 
+        return False
 
-class TokenBucket:
-    def __init__(self, tokens, fill_rate):
-        """
-        tokens is the total tokens in the bucket. fill_rate is the
-        rate in tokens/second that the bucket will be refilled.
-        """
-        self.capacity = float(tokens)
-        self._tokens = float(tokens)
-        self.fill_rate = float(fill_rate)
-        self.timestamp = time.monotonic()
-
-    def consume(self, tokens):
-        """
-        Consume tokens from the bucket. Returns 0 if there were
-        sufficient tokens, otherwise the expected time to wait
-        until enough tokens become available.
-        """
-        if tokens <= self._tokens:
-            self._tokens -= tokens
-            return 0
-        else:
-            delta = time.monotonic() - self.timestamp
-            self._tokens += delta * self.fill_rate
-            self.timestamp = time.monotonic()
-            if tokens <= self._tokens:
-                self._tokens -= tokens
-                return 0
-            else:
-                return (tokens - self._tokens) / self.fill_rate
-
-rate_limits = {}  # Create a global dictionary to manage the rate limits
 
 @app.websocket("/ws/{session_token}")
 async def websocket_endpoint(websocket: WebSocket, session_token: str):
@@ -163,83 +154,63 @@ async def websocket_endpoint(websocket: WebSocket, session_token: str):
         return
 
     user_id, session_token = str(session[0]), session[1]  # Convert UUID to string
-    await manager.connect(websocket, session_token, user_id)
-
-    # Set up rate limit for this user
-    rate_limit = rate_limits.get(user_id, TokenBucket(5, 1))  # Allow 5 messages per second
+    await websocket.accept()
+    connection = await manager.connect(user_id, websocket, session_token)
 
     try:
         while True:
-            wait_time = rate_limit.consume(1)  # Each message consumes one token
-            if wait_time == 0:
-                try:
-                    message = await websocket.receive()
-                    try:
-                        data = json.loads(message)
-                        print(data)
-                        print(type(data))
-                    except json.JSONDecodeError:
-                        print("Received message is not in JSON format.")
-                except Exception as e:
-                    print("An error occurred while receiving the WebSocket message:", e)
-                
-                if await check_session_and_api_key(data.get('session_token'), data.get('api_key')):
-                    print("checking condition")
-                    # Buy Condition
-                    if data.get('condition') == 'buy':
-                        print("buy")
-                        query = """
-                        INSERT INTO user_trades (user_id, tv_buy_id, market_buy_id, take_profit_id, order_error)
-                        VALUES (
-                            (SELECT id FROM users WHERE session_token = $1),
-                            $2,
-                            $3,
-                            $4,
-                            false
-                        )
-                        """
-                        await conn.execute(query, session_token, data.get('tv_buy_id'), data.get('market_buy_id'), data.get('take_profit_id'))
-                    
-                    # Stop Condition    
-                    if data.get('condition') == 'stop':
-                        print("stop")
-                        query = """
-                        UPDATE user_trades
-                        SET stop_loss_id = $1, executed_flag = true, net_amount = $2
-                        WHERE user_id = (SELECT id FROM users WHERE session_token = $3)
-                        AND tv_buy_id = $4
-                        """
-                        await conn.execute(query, data.get('stop_loss_id'), data.get('net_amount'), session_token, data.get('tv_buy_id'))
-                    
-                    # TP Condition
-                    if data.get('condition') == 'tp':
-                        print("tp")
-                        query = """
-                        UPDATE user_trades
-                        SET stop_loss_id = $1, executed_flag = true, net_amount = $2
-                        WHERE user_id = (SELECT id FROM users WHERE session_token = $3)
-                        AND tv_buy_id = $4
-                        """
-                        await conn.execute(query, data.get('stop_loss_id'), data.get('net_amount'), session_token, data.get('tv_buy_id'))
-                else:
-                    # Invalid session based on old session token or api key
-                    print("how tf am i here")
-                    return                  
+            data = await connection.websocket.receive_json()
+            if data.get("type") == "ping": # Needs a ping every 5 min to maintain persistent connection
+                msg = {'type': 'pong'}
+                await manager.send_personal_message(user_id, msg)
+            elif data.get("condition"):
+                await handle_client_condition(user_id, data)
+                msg = {'type': 'Message Properly Recieved!'}
+                await manager.send_personal_message(user_id, msg)
             else:
-                # If rate limit is exceeded, close the connection
-                print("no chance its rate limit")
-                await manager.disconnect(session_token)
-                return
-    except WebSocketDisconnect as e:
+                print('Improper Data!')
+    except WebSocketDisconnect:
+        if user_id in manager.active_connections:
+            del manager.active_connections[user_id]
+    except Exception as e:
         print(e)
-        await manager.disconnect(session_token)
+        await manager.disconnect(user_id)
 
-class Message(BaseModel):
-    data: Dict
-
-
-async def send_message(message: Message):
-    await manager.send_json_to_all(message)
+async def handle_client_condition(user_id, data):
+    conn = app.state.conn
+    if data.get('condition') == 'buy':
+        query = """
+        INSERT INTO user_trades (user_id, tv_buy_id, market_buy_id, take_profit_id, order_error)
+        VALUES (
+            (SELECT id FROM users WHERE id = $1),
+            $2,
+            $3,
+            $4,
+            false
+        )
+        """
+        await conn.execute(query, user_id, data.get('tv_buy_id'), data.get('market_buy_id'), data.get('take_profit_id'))
+    
+    # Stop Condition    
+    if data.get('condition') == 'stop':
+        query = """
+        UPDATE user_trades
+        SET stop_loss_id = $1, executed_flag = true, net_amount = $2
+        WHERE user_id = $3
+        AND tv_buy_id = $4
+        """
+        await conn.execute(query, data.get('stop_loss_id'), data.get('net_amount'), user_id, data.get('tv_buy_id'))
+    
+    # TP Condition
+    if data.get('condition') == 'tp':
+        query = """
+        UPDATE user_trades
+        SET stop_loss_id = $1, executed_flag = true, net_amount = $2
+        WHERE user_id = $3
+        AND tv_buy_id = $4
+        """
+        await conn.execute(query, data.get('stop_loss_id'), data.get('net_amount'), user_id, data.get('tv_buy_id'))
+    
 
 @app.post("/alert")
 async def handle_tradingview_alerts(data: str):
@@ -275,7 +246,7 @@ async def handle_tradingview_alerts(data: str):
             client_json["tp"] = data["tp"]
         else:
             raise HTTPException(status_code=400, detail=f"Incorrect condition")
-        await send_message(client_json)
+        await manager.broadcast(client_json)
     except KeyError as e:
         raise HTTPException(status_code=400, detail=f"Missing required field")
     
@@ -290,12 +261,11 @@ async def alert_take_profit(data: str):
     ticker = data["ticker"]
     tv_buy_id = data["tv_buy_id"]
     query = """
-    SELECT user_id
+    SELECT user_id, market_buy_id, take_profit_id
     FROM user_trades
     WHERE tv_buy_id = $1
     """
-    await conn.execute(query, tv_buy_id)
-    users = conn.fetchall()
+    users = await conn.fetch(query, tv_buy_id)
     if users:
             for row in users:
                 # Get the buy and tp id's
@@ -310,8 +280,8 @@ async def alert_take_profit(data: str):
                     "take_profit_id": take_profit_id
                 }
                 # Send json to the specific websocket with the corresponding market_buy_id
-                user_id = row['user_id']
-                await manager.send_json_to_user(user_id, response)
+                user_id = str(row['user_id'])
+                await manager.send_personal_message(user_id, response)
     
 async def format_and_post_to_discord(data: dict):
     ticker = data.get("ticker")
