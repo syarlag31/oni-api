@@ -175,45 +175,53 @@ async def websocket_endpoint(websocket: WebSocket, session_token: str):
         if user_id in manager.active_connections:
             del manager.active_connections[user_id]
     except Exception as e:
-        print(e)
-        await manager.disconnect(user_id)
+        print("Error: ", e)
 
 async def handle_client_condition(user_id, data):
     conn = app.state.conn
-    if data.get('condition') == 'buy':
-        query = """
-        INSERT INTO user_trades (user_id, tv_buy_id, market_buy_id, take_profit_id, tp, order_error)
-        VALUES (
-            (SELECT id FROM users WHERE id = $1),
-            $2,
-            $3,
-            $4,
-            $5,
-            false
-        )
-        """
-        await conn.execute(query, user_id, data.get('tv_buy_id'), data.get('market_buy_id'), data.get('take_profit_id'), data.get('tp'))
-    
-    # Stop Condition    
-    if data.get('condition') == 'stop':
-        query = """
-        UPDATE user_trades
-        SET stop_loss_id = $1, executed_flag = true, net_amount = $2
-        WHERE user_id = $3
-        AND tv_buy_id = $4
-        """
-        await conn.execute(query, data.get('stop_loss_id'), data.get('net_amount'), user_id, data.get('tv_buy_id'))
-    
-    # TP Condition
-    if data.get('condition') == 'tp':
-        query = """
-        UPDATE user_trades
-        SET stop_loss_id = $1, executed_flag = true, net_amount = $2
-        WHERE user_id = $3
-        AND tv_buy_id = $4
-        """
-        await conn.execute(query, data.get('stop_loss_id'), data.get('net_amount'), user_id, data.get('tv_buy_id'))
-    
+
+    try:
+        if data.get('condition') == 'buy':
+            query = """
+            INSERT INTO user_trades (user_id, tv_buy_id, market_buy_id, take_profit_id, tp, order_error)
+            VALUES (
+                (SELECT id FROM users WHERE id = $1),
+                $2,
+                $3,
+                $4,
+                $5,
+                false
+            )
+            """
+            await conn.execute(query, user_id, data.get('tv_buy_id'), data.get('market_buy_id'), data.get('take_profit_id'), data.get('tp'))
+        
+        # Stop Condition    
+        if data.get('condition') == 'stop':
+            query = """
+            UPDATE user_trades
+            SET stop_loss_id = $1, executed_flag = true, net_amount = $2
+            WHERE user_id = $3
+            AND tv_buy_id = $4
+            """
+            await conn.execute(query, data.get('stop_loss_id'), data.get('net_amount'), user_id, data.get('tv_buy_id'))
+        
+        # TP Condition
+        if data.get('condition') == 'executed':
+            orders = data.get('orders')
+            if orders is not None:
+                for order in orders:
+                    tv_buy_id = order.get('tv_buy_id')
+                    net_amount = order.get('net_amount')
+                    query = """
+                    UPDATE user_trades
+                    SET stop_loss_id = $1, executed_flag = true, net_amount = $2
+                    WHERE user_id = $3
+                    AND tv_buy_id = $4
+                    """
+                    await conn.execute(query, 'INVALID', net_amount, user_id, tv_buy_id)
+
+    except Exception as e:
+        print("Error in Handling Message: ", e)
     
 
 @app.post("/alert")
@@ -260,9 +268,6 @@ async def handle_tradingview_alerts(data: str):
             WHERE tv_buy_id = $1
             """
             users = await conn.fetch(query, tv_buy_id)
-            
-        elif data["condition"] == "executed":
-            
             
             if users:
                 for row in users:
@@ -380,12 +385,12 @@ async def format_and_post_to_discord(data: dict):
 
 async def send_json_message_periodically():
     while True:
-        await asyncio.sleep(3 * 60 * 60)  # Wait for 3 hours
+        await asyncio.sleep(3 * 60 * 60)
         conn = app.state.conn
         query = """
         SELECT user_id, tv_buy_id, market_buy_id, take_profit_id
         FROM user_trades
-        WHERE executed_flag = true
+        WHERE executed_flag = false
         """
         executed_trades = await conn.fetch(query)
 
