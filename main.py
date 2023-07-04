@@ -1,13 +1,12 @@
 import asyncio
 import json
-from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect, Request
 from fastapi.security import APIKeyHeader
 from dotenv import load_dotenv
 from typing import Any, Dict
 from pydantic import BaseModel
 import os
 import secrets
-import time
 import requests
 import asyncpg
 
@@ -217,10 +216,11 @@ async def handle_client_condition(user_id, data):
     
 
 @app.post("/alert")
-async def handle_tradingview_alerts(data: str):
+async def handle_tradingview_alerts(request: Request):
     try:
         conn = app.state.conn
-        data = json.loads(data)
+        alert = await request.body()
+        data = json.loads(alert)
         auth_key = data["oni_auth_key"]
         if auth_key != os.getenv("ONI_AUTH_KEY"):
             raise HTTPException(status_code=401, detail="Improper Authorization Key")
