@@ -1,6 +1,7 @@
 import asyncio
-import json
-from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect, Request
+import ast
+import datetime
+from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect, Request, Body
 from fastapi.security import APIKeyHeader
 from dotenv import load_dotenv
 from typing import Any, Dict
@@ -26,77 +27,14 @@ async def startup_event():
     )
     
     asyncio.create_task(send_json_message_periodically())
+    asyncio.create_task(remove_expired_buys())
+    asyncio.create_task(remove_sent_notifications())
 
 @app.on_event("shutdown")
 async def shutdown_event():
     await app.state.conn.close()
 
 api_key_header = APIKeyHeader(name="Oni-API-Key", auto_error=False)
-
-class Connection:
-    def __init__(self, websocket: WebSocket, session_token: str):
-        self.websocket = websocket
-        self.session_token = session_token
-
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections: Dict[str, Connection] = {}  # user_id: Connection
-
-    async def connect(self, user_id: str, websocket: WebSocket, session_token: str):
-        if user_id in self.active_connections:
-            old_connection = self.active_connections[user_id]
-            if old_connection.session_token != session_token:
-                try:
-                    await old_connection.websocket.send_text("Another session was initiated, disconnecting.")
-                    await old_connection.websocket.close(code=1000)
-                except WebSocketDisconnect:
-                    pass  # If it is already disconnected, pass.
-                del self.active_connections[user_id]  # Remove old connection
-            else:
-                try:
-                    await old_connection.websocket.send_text("Duplicate session detected, disconnecting.")
-                    await old_connection.websocket.close(code=1000)
-                except WebSocketDisconnect:
-                    pass  # If it is already disconnected, pass.
-                del self.active_connections[user_id]  # Remove old connection
-            await asyncio.sleep(3)
-        self.active_connections[user_id] = Connection(websocket, session_token)
-        return self.active_connections[user_id]
-
-    async def disconnect(self, user_id: str):
-        if user_id in self.active_connections:
-            connection = self.active_connections[user_id]
-            if connection.websocket:
-                await connection.websocket.close(code=1001)
-            del self.active_connections[user_id]
-
-    async def send_personal_message(self, user_id: str, message: Dict[str, Any]):
-        if user_id not in self.active_connections:
-            return
-        connection = self.active_connections[user_id]
-        try:
-            await connection.websocket.send_json(message)
-        except WebSocketDisconnect:
-            print(f"Failed to send message to user {user_id}")
-            await self.handle_disconnect(user_id)
-
-    async def broadcast(self, message: Dict[str, Any]):
-        disconnected_users = []
-        for user_id, connection in self.active_connections.items():
-            try:
-                await connection.websocket.send_json(message)
-            except WebSocketDisconnect:
-                print(f"Failed to send message to user {user_id}")
-                disconnected_users.append(user_id)
-        for user_id in disconnected_users:
-            await self.handle_disconnect(user_id)
-
-    async def handle_disconnect(self, user_id: str):
-        print("disconnecting user due to message sent", user_id)
-        await self.disconnect(user_id)
-        # Reconnection logic can be added here if necessary
-
-manager = ConnectionManager()
 
 async def authenticate_user(api_key: str = Depends(api_key_header)):
     try:
@@ -122,77 +60,92 @@ class User(BaseModel):
 @app.post("/login")
 async def get_session_token(user=Depends(authenticate_user)):
     session_token = generate_session_token()
+    conn = app.state.conn
     try:
-        conn = app.state.conn
-        query = "UPDATE users SET session_token = $1 WHERE id = $2"
+        query = "UPDATE users SET session_token = $1 WHERE user_id = $2"
         await conn.execute(query, session_token, user.id)
         return {"session token": session_token}
     except Exception as e:
         raise HTTPException(status_code=401, detail="Invalid API key")
-    
-async def check_session_and_api_key(session_token: str, api_key: str) -> bool:
-    if session_token is None or api_key is None:
-        return False
-    
+
+
+@app.post("/alert")
+async def alert_users(request: Request):
     conn = app.state.conn
-    query = "SELECT id FROM users WHERE session_token = $1 AND api_key = $2"
-    user = await conn.fetch(query, session_token, api_key)
-    
-    if len(user) > 0:
-        return True
-    else: 
-        return False
-
-
-@app.websocket("/ws/{session_token}")
-async def websocket_endpoint(websocket: WebSocket, session_token: str):
-    conn = app.state.conn
-    query = "SELECT id, session_token FROM users WHERE session_token = $1"
-    session = await conn.fetchrow(query, session_token)
-
-    if session is None:
-        await websocket.close(code=1008)
-        return
-
-    user_id, session_token = str(session[0]), session[1]  # Convert UUID to string
-    await websocket.accept()
-    connection = await manager.connect(user_id, websocket, session_token)
-
     try:
-        while True:
-            data = await connection.websocket.receive_json()
-            if data.get("type") == "ping": # Needs a ping every 5 min to maintain persistent connection
-                msg = {'type': 'pong'}
-                await manager.send_personal_message(user_id, msg)
-            elif data.get("condition"):
-                await handle_client_condition(user_id, data)
-                msg = {'type': 'Message Properly Recieved!'}
-                await manager.send_personal_message(user_id, msg)
-            else:
-                print('Improper Data!')
-    except WebSocketDisconnect:
-        if user_id in manager.active_connections:
-            del manager.active_connections[user_id]
+        data = await request.json()
+        auth_key = data["oni_auth_key"]
+        if auth_key != os.getenv("ONI_AUTH_KEY"):
+            raise HTTPException(status_code=401, detail="Improper Authorization Key")
+        
+        if data["condition"] == "buy":
+            await format_and_post_to_discord(data)
+            await send_buy_to_valid_users(data)
+            query = """
+                INSERT INTO buys (tv_buy_id, ticker, script_version)
+                VALUES ($1, $2, $3)
+                """
+            await conn.execute(query, data["tv_buy_id"], data["ticker"], data["script_version"])
+        
+        if data["condition"] == "stop":
+            await send_stop_to_users(data)
+            
     except Exception as e:
-        print("Error: ", e)
+        print(e)
 
+@app.post("/user_endpoint/{api_key}/{session_token}")
+async def handle_user_messages(api_key: str, session_token: str, request: Request):
+    return_data = await request.json()
+    return_data = ast.literal_eval(return_data)
+    
+    if session_token is None or api_key is None:
+        raise HTTPException(status_code=401, detail="Invalid Credentials")
+    
+    conn = app.state.conn
+    query = "SELECT user_id, payment_boolean FROM users WHERE session_token = $1 AND api_key = $2"
+    user = await conn.fetchrow(query, session_token, api_key)
+    if user["payment_boolean"] is False:
+        raise HTTPException(status_code=402, detail="Subsciption Required")
+    
+    if user["user_id"] and len(return_data.get("condition")) > 0:
+        await handle_client_condition(user["user_id"], return_data)
+        
+@app.post("/user_endpoint/trade_data/{api_key}/{session_token}")
+async def give_trade_data(api_key: str, session_token: str):
+    if session_token is None or api_key is None:
+        raise HTTPException(status_code=401, detail="Invalid Credentials")
+    
+    conn = app.state.conn
+    query = "SELECT user_id, payment_boolean FROM users WHERE session_token = $1 AND api_key = $2"
+    user = await conn.fetchrow(query, session_token, api_key)
+    if user["payment_boolean"] is False:
+        raise HTTPException(status_code=402, detail="Subsciption Required")
+    
+    query = '''
+    SELECT tv_buy_id, ticker, executed_flag, net_amount, timestamp
+    FROM user_trades
+    WHERE user_id = $1
+    '''
+    trade_data = await conn.fetch(query, user["user_id"])
+    
+    return trade_data
+    
 async def handle_client_condition(user_id, data):
     conn = app.state.conn
-
+    print(data, type(data))
     try:
         if data.get('condition') == 'buy':
             query = """
-            INSERT INTO user_trades (user_id, tv_buy_id, market_buy_id, take_profit_id, tp, order_error)
+            INSERT INTO user_trades (user_id, tv_buy_id, market_buy_id, take_profit_id, ticker)
             VALUES (
-                (SELECT id FROM users WHERE id = $1),
+                (SELECT user_id FROM users WHERE user_id = $1),
                 $2,
                 $3,
                 $4,
-                $5,
-                false
+                $5
             )
             """
-            await conn.execute(query, user_id, data.get('tv_buy_id'), data.get('market_buy_id'), data.get('take_profit_id'), data.get('tp'))
+            await conn.execute(query, user_id, data.get('tv_buy_id'), data.get('market_buy_id'), data.get('take_profit_id'), data.get('ticker'))
         
         # Stop Condition    
         if data.get('condition') == 'stop':
@@ -221,106 +174,74 @@ async def handle_client_condition(user_id, data):
 
     except Exception as e:
         print("Error in Handling Message: ", e)
-    
 
-@app.post("/alert")
-async def handle_tradingview_alerts(request: Request):
-    try:
-        conn = app.state.conn
-        alert = await request.body()
-        data = json.loads(alert)
-        auth_key = data["oni_auth_key"]
-        if auth_key != os.getenv("ONI_AUTH_KEY"):
-            raise HTTPException(status_code=401, detail="Improper Authorization Key")
-        client_json = {
-            "condition": data["condition"],
-            "ticker": data["ticker"],
-            "tv_buy_id": data["tv_buy_id"]
+async def send_buy_to_valid_users(data: dict):
+    # If the user has the payment_boolean as true, then sends to those users
+    # The data needs to consist of the TradingView String.
+    conn = app.state.conn
+    query = """
+    SELECT user_id
+    FROM users
+    WHERE payment_boolean = True
+    """
+    users = await conn.fetch(query)
+    for user in users:
+        user_id = user["user_id"]
+
+        query = """
+        INSERT INTO notifications (user_id, notification, notification_type, is_sent)
+        VALUES ($1, $2, $3, $4)
+        """
+        notification_data = {
+            "user_id": user_id,
+            "notification": str(data),
+            "notification_type": "timeout", # Timeout notification for buys
+            "is_sent": False,
         }
-
-        if data["condition"] == 'buy':
-            query = """
-                INSERT INTO buys (tv_buy_id, ticker, script_version)
-                VALUES ($1, $2, $3)
-                """
-            await conn.execute(query, data["tv_buy_id"], data["ticker"], data["script_version"])
-            
-            discord = {
-                "ticker": data["ticker"],
-                "color": data["color"],
-                "entry": data["entry"],
-                "tp": data["tp"],
-                "stop": data["stop"],
-                "timestamp": data["timestamp"],
-                "script_version": data["script_version"]
-            }
-            await format_and_post_to_discord(discord)
-            client_json["tp"] = data["tp"]
-            await manager.broadcast(client_json)
-            
-        elif data["condition"] == 'stop':
-            condition = data["condition"]
-            ticker = data["ticker"]
-            tv_buy_id = data["tv_buy_id"]
-            query = """
-            SELECT user_id, market_buy_id, take_profit_id
-            FROM user_trades
-            WHERE tv_buy_id = $1
-            """
-            users = await conn.fetch(query, tv_buy_id)
-            
-            if users:
-                for row in users:
-                    # Get the buy and tp id's
-                    market_buy_id = row['market_buy_id']
-                    take_profit_id = row['take_profit_id']
-                    # Format some json with fields
-                    response = {
-                        "condition": condition,
-                        "ticker": ticker,
-                        "tv_buy_id": tv_buy_id,
-                        "market_buy_id": market_buy_id,
-                        "take_profit_id": take_profit_id
-                    }
-                    # Send json to the specific websocket with the corresponding market_buy_id
-                    user_id = str(row['user_id'])
-                    await manager.send_personal_message(user_id, response)
+        await conn.execute(query, *notification_data.values())
         
-        # elif data["condition"] == 'tp':
-        #     condition = data["condition"]
-        #     ticker = data["ticker"]
-        #     tv_buy_id = data["tv_buy_id"]
-        #     tp = data["tp"]
-        #     query = """
-        #     SELECT user_id, market_buy_id, take_profit_id
-        #     FROM user_trades
-        #     WHERE tv_buy_id = $1 and tp = $2
-        #     """
-        #     users = await conn.fetch(query, tv_buy_id, tp)
+async def send_stop_to_users(data: dict):
+    # Adds the stop message to the notification queue with user specific info
+    conn = app.state.conn
+    
+    condition = data["condition"]
+    ticker = data["ticker"]
+    tv_buy_id = data["tv_buy_id"]
+    
+    query = """
+    SELECT user_id, market_buy_id, take_profit_id
+    FROM user_trades
+    WHERE tv_buy_id = $1
+    """
+    users = await conn.fetch(query, tv_buy_id)
+    if users:
+        for row in users:
+            # Get the buy and tp id's
+            market_buy_id = row['market_buy_id']
+            take_profit_id = row['take_profit_id']
+            # Format some json with fields
+            response = {
+                "condition": condition,
+                "ticker": ticker,
+                "tv_buy_id": tv_buy_id,
+                "market_buy_id": market_buy_id,
+                "take_profit_id": take_profit_id
+            }
+            user_id = str(row['user_id'])
             
-        #     if users:
-        #         for row in users:
-        #             # Get the buy and tp id's
-        #             market_buy_id = row['market_buy_id']
-        #             take_profit_id = row['take_profit_id']
-        #             # Format some json with fields
-        #             response = {
-        #                 "condition": condition,
-        #                 "ticker": ticker,
-        #                 "tv_buy_id": tv_buy_id,
-        #                 "market_buy_id": market_buy_id,
-        #                 "take_profit_id": take_profit_id
-        #             }
-        #             # Send json to the specific websocket with the corresponding market_buy_id
-        #             user_id = str(row['user_id'])
-        #             await manager.send_personal_message(user_id, response)
+            query = """
+            INSERT INTO notifications (user_id, notification, notification_type, is_sent)
+            VALUES ($1, $2, $3, $4)
+            """
+            notification_data = {
+                "user_id": user_id,
+                "notification": str(response),
+                "notification_type": "persistent", # Persistent notification for stop
+                "is_sent": False,
+            }
+            await conn.execute(query, *notification_data.values())
+        
 
-        else:
-            raise HTTPException(status_code=400, detail=f"Incorrect condition")
-    except KeyError as e:
-        raise HTTPException(status_code=400, detail=f"Missing required field")
-    
-    
 async def format_and_post_to_discord(data: dict):
     ticker = data.get("ticker")
     color = data.get("color")
@@ -383,10 +304,13 @@ async def format_and_post_to_discord(data: dict):
 
     return {"message": "Formatted JSON posted to Discord successfully"}
 
+
 async def send_json_message_periodically():
+    conn = app.state.conn
     while True:
+        # Sends message every 3 hours
         await asyncio.sleep(3 * 60 * 60)
-        conn = app.state.conn
+        
         query = """
         SELECT user_id, tv_buy_id, market_buy_id, take_profit_id
         FROM user_trades
@@ -410,8 +334,103 @@ async def send_json_message_periodically():
                     user_orders[user_id] = [order]
 
             for user_id, orders in user_orders.items():
-                message = {
-                    "condition": "check",
-                    "orders": orders
-                }
-                await manager.send_personal_message(user_id, message)
+                query = """
+                SELECT payment_boolean
+                FROM users
+                WHERE user_id = $1
+                """
+                payment_status = await conn.fetchval(query, user_id)
+
+                if payment_status:
+                    message = {
+                        "condition": "check",
+                        "orders": orders
+                    }
+                    # Insert or update the notification in the notifications table
+                    query = """
+                    INSERT INTO notifications (user_id, notification, notification_type, is_sent)
+                    VALUES ($1, $2, $3, $4)
+                    ON CONFLICT (user_id) WHERE (notification_type = 'one-time') DO UPDATE
+                    SET notification = $2, notification_type = $3, is_sent = $4
+                    """
+                    notification_data = {
+                        "user_id": user_id,
+                        "notification": str(message),
+                        "notification_type": "one-time",
+                        "is_sent": False,
+                    }
+                    await conn.execute(query, *notification_data.values())
+                    
+async def remove_expired_buys():
+    conn = app.state.conn
+    while True:
+        # Checks every 30 minutes
+        await asyncio.sleep(30 * 60)
+        
+        # Calculate the datetime one hour ago from now
+        one_hour_ago = datetime.datetime.utcnow() - datetime.timedelta(hours=1)
+
+        delete_query = '''
+        DELETE FROM notifications
+        WHERE notification_type = 'timeout' AND created_at < $1
+        '''
+        await conn.execute(delete_query, one_hour_ago)
+
+async def remove_sent_notifications():
+    conn = app.state.conn
+    while True:
+        # Checks every 45 minutes
+        await asyncio.sleep(45 * 60)
+        
+        query = '''
+        SELECT id
+        FROM notifications
+        WHERE is_sent = true
+        '''
+        rows = await conn.fetch(query)
+
+        notification_ids = [row['id'] for row in rows]
+
+        if notification_ids:
+            # Perform the bulk deletion using a single query
+            delete_query = '''
+            DELETE FROM notifications
+            WHERE id = ANY($1)
+            '''
+            await conn.execute(delete_query, notification_ids)
+                
+@app.get("/wait_for_notification/{session_token}")
+async def wait_for_notification(session_token: str):
+    conn = app.state.conn
+    while True:
+        user = await conn.fetchrow('''
+            SELECT user_id, payment_boolean
+            FROM users
+            WHERE session_token = $1    
+        ''', session_token)
+        user_id = user["user_id"]
+        payment_boolean = user["payment_boolean"]
+        
+        if payment_boolean is False:
+            raise HTTPException(status_code=402, detail="Subsciption Required")
+        
+        if user_id is None:
+            raise HTTPException(status_code=401, detail="Unauthorized User")
+        
+        notification = await conn.fetchrow('''
+            SELECT id, notification
+            FROM notifications
+            WHERE user_id = $1 AND is_sent = false
+            ORDER BY id ASC
+            LIMIT 1
+        ''', user_id)
+    
+        if notification is not None:
+            await conn.execute('''
+                UPDATE notifications
+                SET is_sent = true
+                WHERE id = $1
+            ''', notification['id'])
+            return notification['notification']
+        
+        await asyncio.sleep(60)
