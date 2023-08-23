@@ -13,6 +13,7 @@ import asyncpg
 
 load_dotenv()
 app = FastAPI()
+async_tasks = []
 
 api_key_header = APIKeyHeader(name="Oni-API-Key", auto_error=False)
 
@@ -26,14 +27,26 @@ async def startup_event():
         password=os.getenv("DB_PASSWORD"),
     )
     
-    asyncio.create_task(send_json_message_periodically())
-    asyncio.create_task(remove_expired_buys())
-    asyncio.create_task(remove_sent_notifications())
+    message_task = asyncio.create_task(send_json_message_periodically())
+    expired_task = asyncio.create_task(remove_expired_buys())
+    sent_task = asyncio.create_task(remove_sent_notifications())
+
+    async_tasks.extend([message_task, expired_task, sent_task])
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    await app.state.pool.close()
-    # Needs to stop async tasks or close stalls out
+    # Set a timeout for pool close
+    try:
+        await asyncio.wait_for(app.state.pool.close(), timeout=60)  # 60 seconds timeout
+    except asyncio.TimeoutError:
+        print("Closing the pool took too long!")
+    
+    # Cancel all tasks
+    for task in async_tasks:
+        task.cancel()
+
+    # Give the tasks a chance to clean up after being canceled
+    await asyncio.gather(*async_tasks, return_exceptions=True)
 
 api_key_header = APIKeyHeader(name="Oni-API-Key", auto_error=False)
 
